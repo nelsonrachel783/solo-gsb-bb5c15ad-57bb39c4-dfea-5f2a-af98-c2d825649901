@@ -15,6 +15,10 @@
  *  - 每一刀都贯穿其所在的当前矩形区域；沿板材边缘的修整切也会被记录（缝宽可能小于
  *    标准锯缝，因为余边不足一条完整锯缝）。零件恰好占满方向时不产生该方向的刀。
  *  - 零件在所有已开板材上都放不下时才开启新板；全部板材均无法容纳的零件直接报错。
+ *  - 可选设备最大单刀长度 maxCutLength（留空 = 不限制）：在每个候选落位与朝向下分别
+ *    计算竖切优先、横切优先两种切法中各刀的实际刀长，仅当一种切法的所有刀长均不超过
+ *    上限时该切法才可行；再从可行切法中按现有规则（余料面积 / 评分）选取。现有板无可行
+ *    落位时仍尝试新板，新板也无法加工则报错指出订单、零件与件号，绝不输出超限刀路。
  *
  * 材料费分摊：
  *  - 输入每张原板材料价 boardPrice（非负、最多两位小数，内部按“分”整数计算）。
@@ -71,6 +75,36 @@ function priceToCents(value) {
     throw new UserError('每张原板材料价最多保留两位小数');
   }
   return cents;
+}
+
+/**
+ * 解析设备最大单刀长度：留空（undefined / null / ''）返回 null，表示不限制，
+ * 沿用现有排料规则；填写时必须为正数。
+ */
+function parseMaxCutLength(value) {
+  if (value === undefined || value === null || value === '') return null;
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new UserError('设备最大单刀长度必须是正数（留空则不限制）');
+  }
+  return n;
+}
+
+/**
+ * 一种切法（竖切优先 / 横切优先）中各刀的实际刀长：
+ * 竖切刀长 = 锯缝带高度（贯穿区域全高），横切刀长 = 锯缝带宽度（贯穿区域全宽）。
+ */
+function cutLengths(split) {
+  return split.cuts.map((c) => (c.type === 'v' ? c.band.h : c.band.w));
+}
+
+/**
+ * 切法是否在设备能力内：所有刀的实际刀长均不超过最大单刀长度；
+ * 未设置上限（null）时恒可行。
+ */
+function splitAllowed(split, maxCutLength) {
+  if (maxCutLength === null) return true;
+  return cutLengths(split).every((len) => len <= maxCutLength + EPS);
 }
 
 /**
@@ -240,6 +274,7 @@ function parseInput(input) {
     ? 0
     : num(input.kerf, '锯缝宽度');
   const boardPriceCents = priceToCents(input.boardPrice);
+  const maxCutLength = parseMaxCutLength(input.maxCutLength);
 
   if (boardWidth <= 0) throw new UserError('原板长度必须大于 0');
   if (boardHeight <= 0) throw new UserError('原板宽度必须大于 0');
@@ -332,6 +367,7 @@ function parseInput(input) {
     boardHeight,
     kerf,
     boardPriceCents,
+    maxCutLength,
     groups,
     ordersList,
     totalQty,
@@ -343,12 +379,64 @@ function parseInput(input) {
  * 核心排料：按 groups 顺序（订单 → 零件行 → 数量）逐件断头切割落料。
  * 每个 group 可带 tag = { index, srcBoard }（缺件补切场景）：
  * 落位件号取 tag.index（原件号），并在落位上记录 srcBoard（原板号）。
+ *
+ * maxCutLength：设备最大单刀长度（null 表示不限制）。对每个候选落位（已开板的
+ * 可用矩形 / 新板）与每个朝向，分别构造竖切优先、横切优先两种切法并计算各自的
+ * 实际刀长；仅当一种切法中所有刀长均不超过上限时，该切法才可行。
+ * 同一落位 + 朝向下竖切优先、横切优先之间，沿用“锯缝损耗更小（余料面积更大）”
+ * 的现有规则选取（平局取竖切）；落位 / 朝向之间沿用现有评分规则。
  */
-function layoutParts(boardWidth, boardHeight, kerf, groups) {
+function layoutParts(boardWidth, boardHeight, kerf, groups, maxCutLength) {
   const boards = [];
+
+  // 枚举某零件在指定可用矩形 + 朝向下的可行切法（按现有规则：余料面积大的优先，平局取竖切）
+  const feasibleSplit = (fr, ori) => {
+    const w = Math.min(ori.w, fr.w);
+    const h = Math.min(ori.h, fr.h);
+    const vSplit = buildSplit(fr, w, h, kerf, true);
+    const hSplit = buildSplit(fr, w, h, kerf, false);
+    const vOk = splitAllowed(vSplit, maxCutLength);
+    const hOk = splitAllowed(hSplit, maxCutLength);
+    if (!vOk && !hOk) return null;
+    if (vOk && !hOk) return vSplit;
+    if (hOk && !vOk) return hSplit;
+    // 两种切法刀长均不超限：锯缝损失更小（余料面积更大）的优先，平局取竖切
+    return hSplit.freeArea > vSplit.freeArea + EPS ? hSplit : vSplit;
+  };
+
+  // 现有板均无可行落位时在新板上尝试；新板也无法加工时给出订单 / 零件 / 件号
+  const failPart = (part, index) => {
+    if (maxCutLength === null) {
+      throw new UserError(
+        `订单「${part.order}」零件「${part.name}」尺寸 ${part.width} × ${part.height} 无法放入原板 ${boardWidth} × ${boardHeight}`
+      );
+    }
+    // 给出几何上能放入整板的朝向中，两种切法各自所需的最小刀长上确界，便于现场判断
+    const fr = { x: 0, y: 0, w: boardWidth, h: boardHeight };
+    const oris = [{ w: part.width, h: part.height, rotated: false }];
+    if (Math.abs(part.width - part.height) > EPS) {
+      oris.push({ w: part.height, h: part.width, rotated: true });
+    }
+    const needs = [];
+    for (const ori of oris) {
+      if (ori.w > fr.w + EPS || ori.h > fr.h + EPS) continue;
+      const w = Math.min(ori.w, fr.w);
+      const h = Math.min(ori.h, fr.h);
+      const maxLen = (verticalFirst) => {
+        const s = buildSplit(fr, w, h, kerf, verticalFirst);
+        return s.cuts.length ? Math.max(...cutLengths(s)) : 0;
+      };
+      needs.push(`${ori.rotated ? '旋转' : '不旋转'}朝向下竖切优先需单刀 ${round3(maxLen(true))}、横切优先需单刀 ${round3(maxLen(false))}`);
+    }
+    throw new UserError(
+      `订单「${part.order}」零件「${part.name}」第 ${index} 件无法在最大单刀长度 ${maxCutLength} 内加工` +
+      (needs.length ? `（${needs.join('；')}）` : '（零件旋转后仍大于原板）')
+    );
+  };
 
   for (const part of groups) {
     for (let q = 1; q <= part.quantity; q++) {
+      const index = part.tag ? part.tag.index : q;
       const orientations = [{ w: part.width, h: part.height, rotated: false }];
       if (Math.abs(part.width - part.height) > EPS) {
         orientations.push({ w: part.height, h: part.width, rotated: true });
@@ -370,13 +458,8 @@ function layoutParts(boardWidth, boardHeight, kerf, groups) {
           const fr = board.free[fi];
           for (const ori of orientations) {
             if (ori.w > fr.w + EPS || ori.h > fr.h + EPS) continue;
-            const w = Math.min(ori.w, fr.w);
-            const h = Math.min(ori.h, fr.h);
-
-            const vSplit = buildSplit(fr, w, h, kerf, true);
-            const hSplit = buildSplit(fr, w, h, kerf, false);
-            // 锯缝损失更小（余料面积更大）的方案优先，平局取竖切
-            const split = hSplit.freeArea > vSplit.freeArea + EPS ? hSplit : vSplit;
+            const split = feasibleSplit(fr, ori);
+            if (!split) continue; // 该落位 / 朝向下两种切法均超单刀上限
 
             // 评分：最紧凑的可用区域 → 余料损失最小 → 靠上 → 靠左 → 已开板 → 不旋转
             const score = [
@@ -394,25 +477,23 @@ function layoutParts(boardWidth, boardHeight, kerf, groups) {
         }
       }
 
-      // 现有板材均放不下 → 开新板
+      // 现有板材均无可行落位（放不下或刀长超限）→ 开新板再试
       if (!best) {
         const board = makeBoard(boardWidth, boardHeight);
-        boards.push(board);
         const fr = board.free[0];
-        // 取能放入整板的第一个朝向（非旋转优先，正方形只有一个朝向）
-        const ori0 = orientations.find((o) => o.w <= fr.w + EPS && o.h <= fr.h + EPS);
-        if (!ori0) {
-          // 理论上不会发生：入参校验阶段已拦截
-          throw new UserError(
-            `订单「${part.order}」零件「${part.name}」尺寸 ${part.width} × ${part.height} 无法放入原板 ${boardWidth} × ${boardHeight}`
-          );
+        // 非旋转优先（正方形只有一个朝向）；仅考虑刀长不超限的切法
+        let newBest = null;
+        for (const ori of orientations) {
+          if (ori.w > fr.w + EPS || ori.h > fr.h + EPS) continue;
+          const split = feasibleSplit(fr, ori);
+          if (!split) continue;
+          if (!newBest) newBest = { ori, split };
         }
-        const w = Math.min(ori0.w, fr.w);
-        const h = Math.min(ori0.h, fr.h);
-        const vSplit = buildSplit(fr, w, h, kerf, true);
-        const hSplit = buildSplit(fr, w, h, kerf, false);
-        const split = hSplit.freeArea > vSplit.freeArea + EPS ? hSplit : vSplit;
-        best = { boardIndex: boards.length - 1, freeIndex: 0, ori: ori0, split, fr };
+        if (!newBest) {
+          failPart(part, index);
+        }
+        boards.push(board);
+        best = { boardIndex: boards.length - 1, freeIndex: 0, ori: newBest.ori, split: newBest.split, fr };
       }
 
       const board = boards[best.boardIndex];
@@ -425,7 +506,7 @@ function layoutParts(boardWidth, boardHeight, kerf, groups) {
       board.placements.push({
         order: part.order,
         part: part.name,
-        index: part.tag ? part.tag.index : q,
+        index,
         x: fr.x,
         y: fr.y,
         w,
@@ -513,6 +594,7 @@ function summarizeBoards(boards, boardPriceCents, ordersList) {
       index: bi + 1,
       width: round3(b.width),
       height: round3(b.height),
+      longestCut: cuts.length ? round3(Math.max(...cuts.map((c) => c.length))) : 0,
       placements: b.placements.map((p) => ({
         order: p.order,
         part: p.part,
@@ -564,9 +646,9 @@ function orderSummaryRows(orderSummary) {
  */
 function cutBoards(input) {
   const parsed = parseInput(input);
-  const { boardWidth, boardHeight, kerf, boardPriceCents } = parsed;
+  const { boardWidth, boardHeight, kerf, boardPriceCents, maxCutLength } = parsed;
 
-  const boards = layoutParts(boardWidth, boardHeight, kerf, parsed.groups);
+  const boards = layoutParts(boardWidth, boardHeight, kerf, parsed.groups, maxCutLength);
   const { resultBoards, orderSummary } = summarizeBoards(boards, boardPriceCents, parsed.ordersList);
 
   // 分单取件清单：按订单输入顺序，件内按零件行 / 件号（即切割输入顺序）
@@ -606,6 +688,7 @@ function cutBoards(input) {
     boardHeight: round3(boardHeight),
     kerf: round3(kerf),
     boardPrice: round3(boardPriceCents / 100),
+    maxCutLength: maxCutLength === null ? null : round3(maxCutLength),
     boardsCount: boards.length,
     totalParts: parsed.totalQty,
     totalArea: round3(totalArea),
@@ -640,7 +723,7 @@ function recutBoards(input) {
     throw new UserError('请求体格式不正确');
   }
   const parsed = parseInput(input);
-  const { boardWidth, boardHeight, kerf, boardPriceCents } = parsed;
+  const { boardWidth, boardHeight, kerf, boardPriceCents, maxCutLength } = parsed;
 
   // 以当前排料输入重新计算原方案（原样输出，落位与分摊不受补切影响）
   const original = cutBoards(input);
@@ -724,7 +807,7 @@ function recutBoards(input) {
     tag: { index: s.index, srcBoard: s.srcBoard },
   }));
 
-  const boards = layoutParts(boardWidth, boardHeight, kerf, recutGroups);
+  const boards = layoutParts(boardWidth, boardHeight, kerf, recutGroups, maxCutLength);
 
   // 补切订单汇总仅含涉及订单，顺序仍按原订单输入顺序
   const recutOrdersList = [];
@@ -769,6 +852,7 @@ function recutBoards(input) {
       boardHeight: round3(boardHeight),
       kerf: round3(kerf),
       boardPrice: round3(boardPriceCents / 100),
+      maxCutLength: maxCutLength === null ? null : round3(maxCutLength),
       damagedCount: selected.length,
       addedBoards,
       addedMaterialCents,

@@ -28,11 +28,20 @@ const emptyOrder = (i) => ({ orderNo: '', parts: [{ ...EMPTY_PART }] });
 // 损坏件三元身份：订单号 + 零件名 + 件号（跨订单同名零件互不影响）
 const itemKey = (order, part, index) => JSON.stringify([order, part, index]);
 
+// 设备最大单刀长度：留空表示不限制；填写时必须为正数
+const validateMaxCut = (value) => {
+  const s = String(value).trim();
+  if (s === '') return true;
+  const n = Number(s);
+  return Number.isFinite(n) && n > 0;
+};
+
 export default function App() {
   const [boardWidth, setBoardWidth] = useState(String(SAMPLE_BOARD.boardWidth));
   const [boardHeight, setBoardHeight] = useState(String(SAMPLE_BOARD.boardHeight));
   const [kerf, setKerf] = useState(String(SAMPLE_BOARD.kerf));
   const [boardPrice, setBoardPrice] = useState(String(SAMPLE_BOARD.boardPrice));
+  const [maxCutLength, setMaxCutLength] = useState('');
   const [orders, setOrders] = useState(SAMPLE_ORDERS.map((o) => ({
     orderNo: o.orderNo,
     parts: o.parts.map((p) => ({ ...p })),
@@ -81,6 +90,7 @@ export default function App() {
     setBoardHeight(String(SAMPLE_BOARD.boardHeight));
     setKerf(String(SAMPLE_BOARD.kerf));
     setBoardPrice(String(SAMPLE_BOARD.boardPrice));
+    setMaxCutLength('');
     setOrders(SAMPLE_ORDERS.map((o) => ({ orderNo: o.orderNo, parts: o.parts.map((p) => ({ ...p })) })));
     setResult(null);
     setError('');
@@ -92,6 +102,8 @@ export default function App() {
     boardHeight: Number(boardHeight),
     kerf: kerf === '' ? 0 : Number(kerf),
     boardPrice: boardPrice === '' ? 0 : Number(boardPrice),
+    // 留空不下发该字段：后端按不限制处理，沿用现有排料规则
+    ...(maxCutLength.trim() !== '' ? { maxCutLength: Number(maxCutLength) } : {}),
     orders: orders.map((o) => ({
       orderNo: o.orderNo,
       parts: o.parts.map((p) => ({
@@ -106,6 +118,10 @@ export default function App() {
   const submit = async (e) => {
     e.preventDefault();
     setError('');
+    if (!validateMaxCut(maxCutLength)) {
+      setError('设备最大单刀长度必须为正数（留空则不限制）');
+      return;
+    }
     setResult(null);
     resetRecut();
     setLoading(true);
@@ -141,6 +157,10 @@ export default function App() {
   const submitRecut = async () => {
     if (!result || selected.size === 0) return;
     setRecutError('');
+    if (!validateMaxCut(maxCutLength)) {
+      setRecutError('设备最大单刀长度必须为正数（留空则不限制）');
+      return;
+    }
     setRecut(null);
     setRecutLoading(true);
     // 按分单取件清单顺序收集选中的损坏件（三元身份）
@@ -205,9 +225,18 @@ export default function App() {
                   onChange={(e) => setBoardPrice(e.target.value)} />
               </label>
             </div>
+            <label className="max-cut-field">
+              设备最大单刀长度（选填，留空不限制）
+              <input type="number" step="any" min="0" value={maxCutLength}
+                placeholder="如 800"
+                onChange={(e) => setMaxCutLength(e.target.value)} />
+            </label>
             <p className="hint">
               长度 / 宽度单位保持一致即可（通常为 mm）；材料价非负、最多两位小数，
               每张开料板均按此价计费，再按各订单在该板的零件面积比例分摊。
+              <b>设备最大单刀长度</b>留空时沿用全部既有排料规则；填写后必须为正数，
+              系统会对每个候选落位与朝向分别核算竖切优先、横切优先的实际刀长，
+              只有该切法<b>每一刀均不超过此上限</b>才会采用，不输出超限刀路。
             </p>
 
             <div className="parts-head">
@@ -328,6 +357,18 @@ function ResultView({ result, selected, onToggleDamaged }) {
         原板 {strip(result.boardWidth)} × {strip(result.boardHeight)}，
         单板材料价 ¥{yuan(result.boardPrice * 100)}；
         每板按各订单零件实际面积比例分摊，分位尾差用最大余数法（同余按订单输入顺序）。
+        {result.maxCutLength != null ? (
+          <>
+            <br />
+            <b>设备最大单刀长度上限：{strip(result.maxCutLength)}</b>
+            （仅在每个候选落位 / 朝向下竖切优先、横切优先的全部刀长均不超过该值时才采用，
+            各板实际最长刀长见板图下方统计）。
+          </>
+        ) : (
+          <>
+            <br />未设置设备最大单刀长度，不限制单刀长度（沿用既有排料规则）。
+          </>
+        )}
       </p>
 
       {/* 分单取件 */}
@@ -439,6 +480,9 @@ function ResultView({ result, selected, onToggleDamaged }) {
             <span>余料 {fmt(b.remainderArea)}</span>
             <span>利用率 {b.utilization}%</span>
             <span>{b.cuts.length} 刀</span>
+            {result.maxCutLength != null && (
+              <span className="cut-limit">实际最长刀 {strip(b.longestCut)} / 上限 {strip(result.maxCutLength)}</span>
+            )}
           </div>
 
           {b.cost.shares.length > 0 && (
@@ -550,6 +594,14 @@ function RecutResult({ recut }) {
         <div className="stat"><b>{fmt(recut.partsArea)}</b><span>补切零件面积</span></div>
         <div className="stat"><b>{recut.utilization}%</b><span>补切利用率</span></div>
       </div>
+      <p className="hint">
+        {recut.maxCutLength != null ? (
+          <>
+            <b>设备最大单刀长度上限：{strip(recut.maxCutLength)}</b>
+            （与原方案相同；补切板所有刀长均不超过该值，实际最长刀长见各板统计）。
+          </>
+        ) : '未设置设备最大单刀长度，补切排料同样不限制单刀长度。'}
+      </p>
 
       {/* 补切清单：逐件关联原板号与新板号 */}
       <h3 className="recut-subtitle">补切清单（逐件关联原板号 → 新板号）</h3>
@@ -619,6 +671,9 @@ function RecutResult({ recut }) {
             <span>余料 {fmt(b.remainderArea)}</span>
             <span>利用率 {b.utilization}%</span>
             <span>{b.cuts.length} 刀</span>
+            {recut.maxCutLength != null && (
+              <span className="cut-limit">实际最长刀 {strip(b.longestCut)} / 上限 {strip(recut.maxCutLength)}</span>
+            )}
           </div>
 
           {b.cost.shares.length > 0 && (

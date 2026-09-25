@@ -332,4 +332,148 @@ assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '块' }
 assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '块', index: 0 }] }), UserError, '件号 0 应报错');
 assert.throws(() => recutBoards({ ...base, damaged: [{ order: '', part: '块', index: 1 }] }), UserError, '缺订单号应报错');
 
+// 19) 设备最大单刀长度：留空沿用现有规则；填写时必须为正数
+const unrestricted = cutBoards({
+  boardWidth: 1000, boardHeight: 1000, kerf: 0,
+  parts: [{ name: 'a', width: 600, height: 300, quantity: 1 }],
+});
+assert.strictEqual(unrestricted.maxCutLength, null, '未填上限应为 null');
+const withLimit = cutBoards({
+  boardWidth: 1000, boardHeight: 800, kerf: 3, maxCutLength: 800,
+  parts: [{ name: 'a', width: 600, height: 300, quantity: 1 }],
+});
+assert.strictEqual(withLimit.maxCutLength, 800, '结果应回显所用上限');
+assert.ok(Math.max(...withLimit.boards[0].cuts.map((c) => c.length)) <= 800 + 1e-6);
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000, maxCutLength: 0,
+  parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }],
+}), UserError, '上限为 0 应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000, maxCutLength: -3,
+  parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }],
+}), UserError, '负上限应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 1000, boardHeight: 1000, maxCutLength: 'abc',
+  parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }],
+}), UserError, '非数字上限应报错');
+
+// 20) 上限只允许不超限的切法：600×300 落 1000×800 空板（kerf 3）
+//     竖切优先 = 竖切 800 + 横切 600；横切优先 = 横切 1000 + 竖切 300
+//     不设上限时按现有规则选余料面积更大的横切优先；上限 900 时横切优先超限，
+//     改用竖切优先（800 ≤ 900）
+const noLimitPart = { name: 'a', width: 600, height: 300, quantity: 1 };
+const noLimitBoard = { boardWidth: 1000, boardHeight: 800, kerf: 3 };
+const noLimit = cutBoards({ ...noLimitBoard, parts: [noLimitPart] });
+assert.deepStrictEqual(noLimit.boards[0].cuts.map((c) => c.type), ['h', 'v'], '不限时应按余料规则选横切优先');
+const lim = cutBoards({ ...noLimitBoard, maxCutLength: 900, parts: [noLimitPart] });
+assert.strictEqual(lim.boardsCount, 1);
+const limCuts = lim.boards[0].cuts;
+// 竖切优先：先竖切（长 800），再横切（长 600）
+assert.deepStrictEqual(limCuts.map((c) => c.type), ['v', 'h']);
+assert.strictEqual(limCuts[0].length, 800);
+assert.strictEqual(limCuts[1].length, 600);
+assert.strictEqual(lim.boards[0].longestCut, 800, 'longestCut 应为该板实际最长刀');
+assert(lim.boards[0].longestCut <= 900 + 1e-6, '实际最长刀不得超过上限');
+// 上限 800 时竖切优先恰好可行（边界值，容差内）
+const limEdge = cutBoards({ ...noLimitBoard, maxCutLength: 800, parts: [noLimitPart] });
+assert.deepStrictEqual(limEdge.boards[0].cuts.map((c) => c.type), ['v', 'h']);
+// 上限 799 时两种切法均超限（新板也无法加工）
+assert.throws(() => cutBoards({ ...noLimitBoard, maxCutLength: 799, parts: [noLimitPart] }), UserError);
+
+// 21) 上限迫使切法改变：竖切优先可行、横切优先不可行时选竖切优先
+//     零件 600×700：竖切优先 = 竖切 1000 + 横切 600（竖切超限）；
+//     横切优先 = 横切 1000 + 竖切 700（横切超限）。上限 900 时：
+//     竖切优先仍有 1000 刀 → 不可行；旋转 700×600：竖切优先 = 1000 + 横切 700（不可行），
+//     横切优先 = 横切 1000 + 竖切 600（不可行）→ 新板也无法加工，报错并给出订单 / 零件 / 件号
+const badInput = {
+  boardWidth: 1000, boardHeight: 1000, kerf: 0, maxCutLength: 900,
+  orders: [{ orderNo: 'SO-X', parts: [{ name: '大板', width: 600, height: 700, quantity: 2 }] }],
+};
+let errMsg = '';
+try {
+  cutBoards(badInput);
+  assert.fail('应当因超刀长报错');
+} catch (e) {
+  assert(e instanceof UserError);
+  errMsg = e.message;
+}
+assert(/SO-X/.test(errMsg) && /大板/.test(errMsg) && /第 1 件/.test(errMsg),
+  '错误信息应指出订单、零件与件号：' + errMsg);
+assert(/900/.test(errMsg), '错误信息应给出上限：' + errMsg);
+
+// 22) 现有板无可行落位时仍尝试新板：先放一件让现有余料全是窄条，第二件只能开新板
+//     板 1000×1000、上限 1000（仅整板级刀路可行）：第一件 300×300 后，余料为
+//     700×1000 与 300×700；第二件 900×900 放不进现有余料 → 开新板，新板横切 900、竖切 900 可行
+const nb = cutBoards({
+  boardWidth: 1000, boardHeight: 1000, kerf: 0, maxCutLength: 1000,
+  parts: [
+    { name: '小块', width: 300, height: 300, quantity: 1 },
+    { name: '大块', width: 900, height: 900, quantity: 1 },
+  ],
+});
+assert.strictEqual(nb.boardsCount, 2, '现有板放不下应开新板');
+assert(nb.boards[1].longestCut <= 1000 + 1e-6);
+
+// 23) 上限逐板生效：所有板的所有刀长都不得超过上限
+const ml = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3, maxCutLength: 800,
+  orders: [
+    { orderNo: 'A', parts: [{ name: '块', width: 400, height: 300, quantity: 5 }] },
+    { orderNo: 'B', parts: [{ name: '条', width: 500, height: 200, quantity: 4 }] },
+  ],
+});
+for (const b of ml.boards) {
+  for (const c of b.cuts) {
+    assert(c.length <= 800 + 1e-6,
+      `板 ${b.index} 第 ${c.seq} 刀长 ${c.length} 超过上限 800`);
+  }
+}
+// 面积守恒、零件不重叠仍成立
+for (const b of ml.boards) {
+  assert(Math.abs(b.width * b.height - b.partsArea - b.kerfArea - b.remainderArea) < 0.01);
+  const ps = b.placements;
+  for (let i = 0; i < ps.length; i++) {
+    for (let j = i + 1; j < ps.length; j++) {
+      const a = ps[i], c = ps[j];
+      const overlap = a.x < c.x + c.w - 1e-6 && c.x < a.x + a.w - 1e-6 &&
+        a.y < c.y + c.h - 1e-6 && c.y < a.y + a.h - 1e-6;
+      assert(!overlap, `板 ${b.index} 零件重叠`);
+    }
+  }
+}
+
+// 24) 缺件补切同样受上限约束；原方案 / 补切方案均回显上限，超限则报错且不产出刀路
+const rcBase = {
+  boardWidth: 1200, boardHeight: 800, kerf: 0, maxCutLength: 800,
+  orders: [
+    { orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] },
+    { orderNo: 'B', parts: [{ name: '块', width: 600, height: 400, quantity: 5 }] },
+  ],
+};
+const rcLim = recutBoards({
+  ...rcBase,
+  damaged: [
+    { order: 'B', part: '块', index: 2 },
+    { order: 'A', part: '块', index: 5 },
+  ],
+});
+assert.strictEqual(rcLim.original.maxCutLength, 800);
+assert.strictEqual(rcLim.recut.maxCutLength, 800);
+for (const b of rcLim.recut.boards) {
+  for (const c of b.cuts) assert(c.length <= 800 + 1e-6, `补切板刀长 ${c.length} 超限`);
+}
+// 补切新板也无法加工 → 报错且包含三元身份
+try {
+  recutBoards({
+    boardWidth: 600, boardHeight: 500, kerf: 0, maxCutLength: 400,
+    orders: [{ orderNo: 'R', parts: [{ name: '横条', width: 550, height: 450, quantity: 1 }] }],
+    damaged: [{ order: 'R', part: '横条', index: 1 }],
+  });
+  assert.fail('补切超刀长应报错');
+} catch (e) {
+  assert(e instanceof UserError);
+  assert(/R/.test(e.message) && /横条/.test(e.message) && /第 1 件/.test(e.message),
+    '补切超限错误应指出订单 / 零件 / 件号：' + e.message);
+}
+
 console.log('全部算法自检通过 ✔');

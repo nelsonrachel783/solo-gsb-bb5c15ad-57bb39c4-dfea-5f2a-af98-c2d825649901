@@ -53,6 +53,7 @@ h2:first-child { margin-top: 0; }
 .grid-4 { display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; }
 @media (max-width: 1100px) { .grid-4 { grid-template-columns: 1fr 1fr; } }
 label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: #334155; }
+.max-cut-field { margin-top: 10px; }
 
 input[type="number"], input[type="text"], input:not([type]) {
   width: 100%;
@@ -290,6 +291,7 @@ summary { cursor: pointer; font-size: 13px; color: var(--blue); }
   font-weight: 600;
   color: #b45309;
 }
+.cut-limit { font-weight: 600; color: #b45309; }
 .cost-table { margin-top: 10px; }
 
 /* ---- 缺件补切 ---- */
