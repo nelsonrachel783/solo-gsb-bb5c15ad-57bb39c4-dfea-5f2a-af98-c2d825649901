@@ -33,6 +33,7 @@ export default function App() {
   const [boardHeight, setBoardHeight] = useState(String(SAMPLE_BOARD.boardHeight));
   const [kerf, setKerf] = useState(String(SAMPLE_BOARD.kerf));
   const [boardPrice, setBoardPrice] = useState(String(SAMPLE_BOARD.boardPrice));
+  const [maxCutLength, setMaxCutLength] = useState(''); // 设备最大单刀长度，留空不限制
   const [orders, setOrders] = useState(SAMPLE_ORDERS.map((o) => ({
     orderNo: o.orderNo,
     parts: o.parts.map((p) => ({ ...p })),
@@ -81,6 +82,7 @@ export default function App() {
     setBoardHeight(String(SAMPLE_BOARD.boardHeight));
     setKerf(String(SAMPLE_BOARD.kerf));
     setBoardPrice(String(SAMPLE_BOARD.boardPrice));
+    setMaxCutLength('');
     setOrders(SAMPLE_ORDERS.map((o) => ({ orderNo: o.orderNo, parts: o.parts.map((p) => ({ ...p })) })));
     setResult(null);
     setError('');
@@ -92,6 +94,8 @@ export default function App() {
     boardHeight: Number(boardHeight),
     kerf: kerf === '' ? 0 : Number(kerf),
     boardPrice: boardPrice === '' ? 0 : Number(boardPrice),
+    // 设备最大单刀长度：留空则不限制（后端沿用既有排料规则）
+    maxCutLength: maxCutLength.trim() === '' ? null : Number(maxCutLength),
     orders: orders.map((o) => ({
       orderNo: o.orderNo,
       parts: o.parts.map((p) => ({
@@ -108,6 +112,10 @@ export default function App() {
     setError('');
     setResult(null);
     resetRecut();
+    if (maxCutLength.trim() !== '' && !(Number(maxCutLength) > 0)) {
+      setError('设备最大单刀长度必须为正数（留空则不限制单刀长度）');
+      return;
+    }
     setLoading(true);
     try {
       const res = await fetch('/api/cut', {
@@ -140,6 +148,10 @@ export default function App() {
 
   const submitRecut = async () => {
     if (!result || selected.size === 0) return;
+    if (maxCutLength.trim() !== '' && !(Number(maxCutLength) > 0)) {
+      setRecutError('设备最大单刀长度必须为正数（留空则不限制单刀长度）');
+      return;
+    }
     setRecutError('');
     setRecut(null);
     setRecutLoading(true);
@@ -205,9 +217,18 @@ export default function App() {
                   onChange={(e) => setBoardPrice(e.target.value)} />
               </label>
             </div>
+            <label className="max-cut-field">
+              设备最大单刀长度（可选）
+              <input type="number" step="any" min="0" value={maxCutLength}
+                placeholder="留空：不限制单刀长度"
+                onChange={(e) => setMaxCutLength(e.target.value)} />
+            </label>
             <p className="hint">
               长度 / 宽度单位保持一致即可（通常为 mm）；材料价非负、最多两位小数，
               每张开料板均按此价计费，再按各订单在该板的零件面积比例分摊。
+              <b>设备最大单刀长度</b>填写时必须为正数：系统会在每个候选落位与朝向下分别验算
+              竖切优先、横切优先的实际刀长，只采用所有刀长均不超过该上限的切法；
+              留空则不限制，沿用既有排料规则。
             </p>
 
             <div className="parts-head">
@@ -284,6 +305,7 @@ export default function App() {
                 <li>逐板裁切图、零件落位表与刀序继续可用，色块左上角标注订单号</li>
                 <li>结果按订单列出跨板件号、所在板号与坐标，方便分单取件</li>
                 <li>每板材料费按订单零件面积比例分摊（最大余数法分配分位尾差）</li>
+                <li>可填设备最大单刀长度：只输出所有刀长均不超过上限的竖切 / 横切切法</li>
                 <li>在分单取件清单勾选损坏件，可生成独立的缺件补切方案</li>
               </ul>
             </div>
@@ -327,6 +349,10 @@ function ResultView({ result, selected, onToggleDamaged }) {
       <p className="hint">
         原板 {strip(result.boardWidth)} × {strip(result.boardHeight)}，
         单板材料价 ¥{yuan(result.boardPrice * 100)}；
+        设备最大单刀长度：{result.maxCutLength === null || result.maxCutLength === undefined
+          ? <b>未设置（不限制单刀长度）</b>
+          : <b>{strip(result.maxCutLength)}</b>}
+        ，所有刀路的单刀长度均不超过该上限；
         每板按各订单零件实际面积比例分摊，分位尾差用最大余数法（同余按订单输入顺序）。
       </p>
 
@@ -550,6 +576,12 @@ function RecutResult({ recut }) {
         <div className="stat"><b>{fmt(recut.partsArea)}</b><span>补切零件面积</span></div>
         <div className="stat"><b>{recut.utilization}%</b><span>补切利用率</span></div>
       </div>
+      <p className="hint">
+        设备最大单刀长度：{recut.maxCutLength === null || recut.maxCutLength === undefined
+          ? <b>未设置（不限制单刀长度）</b>
+          : <b>{strip(recut.maxCutLength)}</b>}
+        ，补切方案中所有刀路的单刀长度均不超过该上限。
+      </p>
 
       {/* 补切清单：逐件关联原板号与新板号 */}
       <h3 className="recut-subtitle">补切清单（逐件关联原板号 → 新板号）</h3>

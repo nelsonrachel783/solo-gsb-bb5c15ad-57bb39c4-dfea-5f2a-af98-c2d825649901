@@ -332,4 +332,122 @@ assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '块' }
 assert.throws(() => recutBoards({ ...base, damaged: [{ order: 'A', part: '块', index: 0 }] }), UserError, '件号 0 应报错');
 assert.throws(() => recutBoards({ ...base, damaged: [{ order: '', part: '块', index: 1 }] }), UserError, '缺订单号应报错');
 
+// 19) 设备最大单刀长度：留空 / 缺省 / null 均不限制，结果回显 null
+const noLimit = cutBoards({
+  boardWidth: 1000, boardHeight: 800, kerf: 0,
+  parts: [{ name: 'a', width: 300, height: 300, quantity: 2 }],
+});
+assert.strictEqual(noLimit.maxCutLength, null);
+const noLimitEmpty = cutBoards({
+  boardWidth: 1000, boardHeight: 800, kerf: 0, maxCutLength: '',
+  parts: [{ name: 'a', width: 300, height: 300, quantity: 2 }],
+});
+assert.strictEqual(noLimitEmpty.maxCutLength, null);
+
+// 上限足够大时与不限制的排料 / 刀路完全一致（沿用既有排料规则）
+const bigLimit = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3, maxCutLength: 5000,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 3 }] }],
+});
+const bigLimitOff = cutBoards({
+  boardWidth: 1200, boardHeight: 800, kerf: 3,
+  orders: [{ orderNo: 'A', parts: [{ name: '块', width: 600, height: 400, quantity: 3 }] }],
+});
+assert.deepStrictEqual(
+  bigLimit.boards.map((b) => b.cuts),
+  bigLimitOff.boards.map((b) => b.cuts)
+);
+assert.strictEqual(bigLimit.maxCutLength, 5000);
+
+// 20) 上限触发切法切换：板 800×1000、件 600×400
+//   竖切优先首刀 1000 超过上限 900；横切优先两刀 800、400 均不超限 → 改取横切优先
+const switched = cutBoards({
+  boardWidth: 800, boardHeight: 1000, kerf: 0, maxCutLength: 900,
+  orders: [{ orderNo: 'A', parts: [{ name: 'P', width: 600, height: 400, quantity: 1 }] }],
+});
+assert.deepStrictEqual(switched.boards[0].cuts.map((c) => [c.type, c.length]), [['h', 800], ['v', 400]]);
+// 不限制时按既有规则（平局取竖切）为竖切优先
+const switchedOff = cutBoards({
+  boardWidth: 800, boardHeight: 1000, kerf: 0,
+  orders: [{ orderNo: 'A', parts: [{ name: 'P', width: 600, height: 400, quantity: 1 }] }],
+});
+assert.deepStrictEqual(switchedOff.boards[0].cuts.map((c) => [c.type, c.length]), [['v', 1000], ['h', 600]]);
+
+// 刀长恰好等于上限也允许；且输出刀路中不存在任何超过上限的刀
+const equalLimit = cutBoards({
+  boardWidth: 800, boardHeight: 1000, kerf: 0, maxCutLength: 1000,
+  orders: [{ orderNo: 'A', parts: [{ name: 'P', width: 600, height: 400, quantity: 1 }] }],
+});
+assert.deepStrictEqual(equalLimit.boards[0].cuts.map((c) => [c.type, c.length]), [['v', 1000], ['h', 600]]);
+for (const b of switched.boards) {
+  for (const c of b.cuts) assert(c.length <= 900 + 1e-6, '刀长不得超过设备上限');
+}
+
+// 21) 现有板与新板均无法在上限内加工 → 报错并指出订单、零件、件号；不返回任何方案数据
+try {
+  cutBoards({
+    boardWidth: 1000, boardHeight: 1000, kerf: 0, maxCutLength: 800,
+    orders: [{ orderNo: 'O1', parts: [{ name: '大板件', width: 500, height: 500, quantity: 2 }] }],
+  });
+  assert.fail('超过最大单刀长度且无法加工时应报错');
+} catch (err) {
+  assert.ok(err instanceof UserError);
+  assert.ok(err.message.includes('O1') && err.message.includes('大板件') && err.message.includes('第 1 件'),
+    `报错信息应含订单 / 零件 / 件号：${err.message}`);
+  assert.ok(err.message.includes('800'), '报错信息应含上限数值');
+}
+
+// 22) 受上限影响现有板无可行切法时仍尝试新板：
+//   板 1000×1500、上限 1200；首件 600×800 以横切优先落板1（竖切首刀 1500 超限），
+//   板1余料无可行落位后第二件 900×1100 开新板加工，两板刀长均不超限
+const newBoard = cutBoards({
+  boardWidth: 1000, boardHeight: 1500, kerf: 0, maxCutLength: 1200,
+  orders: [{ orderNo: 'A', parts: [
+    { name: 'A1', width: 600, height: 800, quantity: 1 },
+    { name: 'A2', width: 900, height: 1100, quantity: 1 },
+  ] }],
+});
+assert.strictEqual(newBoard.boardsCount, 2);
+assert.deepStrictEqual(newBoard.boards.map((b) => b.placements.map((p) => p.part)), [['A1'], ['A2']]);
+for (const b of newBoard.boards) {
+  for (const c of b.cuts) assert(c.length <= 1200 + 1e-6, '新板方案刀长也不得超过上限');
+}
+// 面积守恒仍成立
+for (const b of newBoard.boards) {
+  assert(Math.abs(b.width * b.height - b.partsArea - b.kerfArea - b.remainderArea) < 0.01);
+}
+
+// 23) 上限参数校验：必须为正数
+assert.throws(() => cutBoards({
+  boardWidth: 100, boardHeight: 100, maxCutLength: 0,
+  parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }],
+}), UserError, '上限为 0 应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 100, boardHeight: 100, maxCutLength: -3,
+  parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }],
+}), UserError, '负上限应报错');
+assert.throws(() => cutBoards({
+  boardWidth: 100, boardHeight: 100, maxCutLength: 'abc',
+  parts: [{ name: 'a', width: 10, height: 10, quantity: 1 }],
+}), UserError, '非数字上限应报错');
+
+// 24) 补切同样遵守上限：回显上限、选择不超限的切法；补切不可加工时按三元身份报错
+const rcLimit = recutBoards({
+  boardWidth: 800, boardHeight: 1000, kerf: 0, maxCutLength: 900,
+  orders: [{ orderNo: 'A', parts: [{ name: 'P', width: 600, height: 400, quantity: 2 }] }],
+  damaged: [{ order: 'A', part: 'P', index: 1 }],
+});
+assert.strictEqual(rcLimit.original.maxCutLength, 900);
+assert.strictEqual(rcLimit.recut.maxCutLength, 900);
+assert.deepStrictEqual(
+  rcLimit.recut.boards[0].cuts.map((c) => [c.type, c.length]),
+  [['h', 800], ['v', 400]]
+);
+assert.throws(() => recutBoards({
+  boardWidth: 1000, boardHeight: 1000, kerf: 0, maxCutLength: 800,
+  orders: [{ orderNo: 'X', parts: [{ name: 'Q', width: 500, height: 500, quantity: 1 }] }],
+  damaged: [{ order: 'X', part: 'Q', index: 1 }],
+}), (err) => err instanceof UserError && err.message.includes('X') && err.message.includes('Q') && err.message.includes('第 1 件'),
+  '补切无法加工时应指出订单 / 零件 / 件号');
+
 console.log('全部算法自检通过 ✔');
